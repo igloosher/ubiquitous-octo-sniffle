@@ -6,6 +6,8 @@ import logging
 import os
 import http.client
 import json
+import keyword
+import re
 import textwrap
 import secrets
 import string
@@ -21,6 +23,123 @@ CMD_ENV = {
         'UMASK': '0002',
         'LD_LIBRARY_PATH': '/usr/sqlite330/lib',
 }
+
+DEFAULT_PYTHON_VERSION = '3.12'
+DEFAULT_DJANGO_VERSION = '6.0.5'
+DEFAULT_PROJECT_NAME = 'myproject'
+PROJECT_NAME_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+# OSVar names that the orchestrator sets when the postgres branch is enabled.
+DB_ENV_VARS = ('DB_NAME', 'DB_USER', 'DB_PASS', 'DB_HOST', 'DB_PORT')
+DB_ENGINE_DEFAULT = 'django.db.backends.postgresql'
+
+SED_ALLOWED_HOSTS_CMD_TEMPLATE = (
+    r'''sed -r -i "s/^ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = \['\*'\]/" '''
+    r'''{appdir}/{project_name}/{project_name}/settings.py'''
+)
+
+UWSGI_CONF_TEMPLATE = textwrap.dedent('''\
+    [uwsgi]
+    master = True
+    http-socket = 127.0.0.1:{port}
+    env = LD_LIBRARY_PATH=/usr/sqlite330/lib
+    virtualenv = {appdir}/env/
+    daemonize = /home/{osuser_name}/logs/apps/{app_name}/uwsgi.log
+    pidfile = {appdir}/tmp/uwsgi.pid
+    workers = 2
+    threads = 2
+
+    # adjust the following to point to your project
+    python-path = {appdir}/{project_name}
+    wsgi-file = {appdir}/{project_name}/{project_name}/wsgi.py
+    touch-reload = {appdir}/{project_name}/{project_name}/wsgi.py
+    ''')
+
+START_SCRIPT_TEMPLATE = textwrap.dedent('''\
+    #!/bin/bash
+    export TMPDIR={appdir}/tmp
+    export LD_LIBRARY_PATH=/usr/sqlite330/lib
+    mkdir -p {appdir}/tmp
+    PIDFILE="{appdir}/tmp/uwsgi.pid"
+
+    if [ -e "$PIDFILE" ] && (pgrep -u {osuser_name} | grep -x -f $PIDFILE &> /dev/null); then
+      echo "uWSGI for {app_name} already running."
+      exit 99
+    fi
+
+    {appdir}/env/bin/uwsgi --ini {appdir}/uwsgi.ini
+
+    echo "Started uWSGI for {app_name}."
+    ''')
+
+STOP_SCRIPT_TEMPLATE = textwrap.dedent('''\
+    #!/bin/bash
+    PIDFILE="{appdir}/tmp/uwsgi.pid"
+
+    if [ ! -e "$PIDFILE" ]; then
+        echo "$PIDFILE missing, maybe uWSGI is already stopped?"
+        exit 99
+    fi
+
+    PID=$(cat $PIDFILE)
+
+    if [ -e "$PIDFILE" ] && (pgrep -u {osuser_name} | grep -x -f $PIDFILE &> /dev/null); then
+      {appdir}/env/bin/uwsgi --stop $PIDFILE
+      sleep 3
+    fi
+
+    if [ -e "$PIDFILE" ] && (pgrep -u {osuser_name} | grep -x -f $PIDFILE &> /dev/null); then
+      echo "uWSGI did not stop, killing it."
+      sleep 3
+      kill -9 $PID
+    fi
+    rm -f $PIDFILE
+    echo "Stopped."
+    ''')
+
+README_TEMPLATE = textwrap.dedent('''\
+    # Opalstack Django README
+
+    ## Post-install steps
+
+    Please take the following steps before you begin to use your Django
+    installation:
+
+    1. Connect your Django application to a site route in the control panel.
+
+    2. Edit {appdir}/{project_name}/{project_name}/settings.py to set ALLOWED_HOSTS
+       to include your site's domains. Example:
+
+           ALLOWED_HOSTS = ['domain.com', 'www.domain.com']
+
+    3. Run the following commands to restart your Django instance:
+
+       {appdir}/stop
+       {appdir}/start
+
+    ## Using your own project
+
+    If you want to serve your own Django project from this instance:
+
+    1. Upload your project directory to {appdir}
+
+    2. Activate the app's environment:
+
+           source {appdir}/env/bin/activate
+
+    3. Install your project's Python dependencies with pip.
+
+    4. Edit {appdir}/uwsgi.ini to point `wsgi-file` and `touch-reload` at your project's WSGI handler
+
+    5. Run the following commands to restart your Django instance:
+
+       {appdir}/stop
+       {appdir}/start
+
+    ## More info
+
+    See https://docs.opalstack.com/topic-guides/django/ for more information.
+    ''')
 
 
 class OpalstackAPITool():
@@ -41,7 +160,7 @@ class OpalstackAPITool():
                          headers={'Content-type': 'application/json'})
             result = json.loads(conn.getresponse().read())
             if not result.get('token'):
-                logging.warn('Invalid username or password and no auth token provided, exiting.')
+                logging.warning('Invalid username or password and no auth token provided, exiting.')
                 sys.exit()
             else:
                 authtoken = result['token']
@@ -124,12 +243,54 @@ def add_cronjob(cronjob):
     logging.info(f'Added cron job: {cronjob}')
 
 
+def build_databases_block(engine, name, user, password, host, port):
+    """builds a Django DATABASES literal using repr to escape values safely"""
+    return (
+        'DATABASES = {\n'
+        "    'default': {\n"
+        f"        'ENGINE': {engine!r},\n"
+        f"        'NAME': {name!r},\n"
+        f"        'USER': {user!r},\n"
+        f"        'PASSWORD': {password!r},\n"
+        f"        'HOST': {host!r},\n"
+        f"        'PORT': {port!r},\n"
+        '    },\n'
+        '}'
+    )
+
+
+def rewrite_databases_in_settings(settings_path, new_block):
+    """replaces the existing DATABASES = {...} literal in settings.py by walking braces"""
+    with open(settings_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    marker = 'DATABASES = {'
+    start = text.find(marker)
+    if start < 0:
+        raise RuntimeError(f'DATABASES marker not found in {settings_path}')
+    depth = 0
+    end = None
+    for i in range(start + len(marker) - 1, len(text)):
+        ch = text[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end is None:
+        raise RuntimeError(f'Unbalanced braces in DATABASES block in {settings_path}')
+    with open(settings_path, 'w', encoding='utf-8') as f:
+        f.write(text[:start] + new_block + text[end:])
+
 
 def main():
     """run it"""
     # grab args from cmd or env
+
     parser = argparse.ArgumentParser(
         description='Installs Django on Opalstack account')
+
     parser.add_argument('-i', dest='app_uuid', help='UUID of the base app',
                         default=os.environ.get('UUID'))
     parser.add_argument('-n', dest='app_name', help='name of the base app',
@@ -140,7 +301,20 @@ def main():
                         default=os.environ.get('OPAL_USER'))
     parser.add_argument('-p', dest='opal_password', help='Opalstack account password',
                         default=os.environ.get('OPAL_PASS'))
+    parser.add_argument('--python-version', dest='python_version',
+                        help='Python version to use for the virtualenv (e.g. 3.12)',
+                        default=os.environ.get('PYTHON_VERSION', DEFAULT_PYTHON_VERSION))
+    parser.add_argument('--django-version', dest='django_version',
+                        help='Django version to install (e.g. 6.0.5)',
+                        default=os.environ.get('DJANGO_VERSION', DEFAULT_DJANGO_VERSION))
+    parser.add_argument('--project-name', dest='project_name',
+                        help='Django project (Python package) name (e.g. myproject)',
+                        default=os.environ.get('PROJECT_NAME', DEFAULT_PROJECT_NAME))
     args = parser.parse_args()
+
+    # validate Django project name (must be a valid Python identifier and not a keyword)
+    if not PROJECT_NAME_RE.match(args.project_name) or keyword.iskeyword(args.project_name):
+        sys.exit(f'Invalid Django project name: {args.project_name!r}')
 
     # init logging
     logging.basicConfig(level=logging.INFO,
@@ -157,161 +331,88 @@ def main():
     CMD_ENV['TMPDIR'] = f'{appdir}/tmp'
 
     # create virtualenv
-    python_executable_path = run_command('which python3.12').decode('utf-8').strip()
-    cmd = f'{python_executable_path} -m venv {appdir}/env'
-    doit = run_command(cmd)
-    logging.info(f'Created virtualenv at {appdir}/env')
+    python_executable_path = run_command(f'which python{args.python_version}').decode('utf-8').strip()
+    run_command(f'{python_executable_path} -m venv {appdir}/env')
+    logging.info(f'Created virtualenv at {appdir}/env using python{args.python_version}')
 
     # install uwsgi
-    cmd = f'scl enable devtoolset-11 -- {appdir}/env/bin/pip install uwsgi'
-    doit = run_command(cmd)
-    perms = run_command(f'chmod 700 {appdir}/env/bin/uwsgi')
+    run_command(f'scl enable devtoolset-11 -- {appdir}/env/bin/pip install uwsgi')
+    run_command(f'chmod 700 {appdir}/env/bin/uwsgi')
     logging.info('Installed latest uWSGI into virtualenv')
 
     # install django
-    cmd = f'scl enable devtoolset-11 -- {appdir}/env/bin/pip install django==6.0.5'
-    doit = run_command(cmd)
-    logging.info('Installed latest Django into virtualenv')
+    run_command(f'scl enable devtoolset-11 -- {appdir}/env/bin/pip install django=={args.django_version}')
+    logging.info(f'Installed Django {args.django_version} into virtualenv')
 
     # create project dir
-    os.mkdir(f'{appdir}/myproject', 0o700)
-    logging.info(f'Created Django project directory {appdir}/myproject')
+    os.mkdir(f'{appdir}/{args.project_name}', 0o700)
+    logging.info(f'Created Django project directory {appdir}/{args.project_name}')
 
     # run startproject with dir option
-    cmd = f'{appdir}/env/bin/django-admin startproject myproject {appdir}/myproject'
-    doit = run_command(cmd)
-    logging.info(f'Populated Django project directory {appdir}/myproject')
+    run_command(f'{appdir}/env/bin/django-admin startproject {args.project_name} {appdir}/{args.project_name}')
+    logging.info(f'Populated Django project directory {appdir}/{args.project_name}')
 
     # django config
     # set ALLOWED_HOSTS
-    cmd = f'''sed -r -i "s/^ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = \['\*'\]/" {appdir}/myproject/myproject/settings.py'''
-    doit = run_command(cmd)
-    logging.info(f'Wrote initial Django config to {appdir}/myproject/myproject/settings.py')
+    run_command(SED_ALLOWED_HOSTS_CMD_TEMPLATE.format(appdir=appdir, project_name=args.project_name))
+    logging.info(f'Wrote initial Django config to {appdir}/{args.project_name}/{args.project_name}/settings.py')
+
+    # optional postgres wiring: when DB_* OSVars are present, install psycopg and rewrite DATABASES
+    if all(os.environ.get(k) for k in DB_ENV_VARS):
+        run_command(f'scl enable devtoolset-11 -- {appdir}/env/bin/pip install psycopg[binary]')
+        logging.info('Installed psycopg[binary] into virtualenv')
+        settings_path = f'{appdir}/{args.project_name}/{args.project_name}/settings.py'
+        new_databases = build_databases_block(
+            engine=os.environ.get('DB_ENGINE', DB_ENGINE_DEFAULT),
+            name=os.environ['DB_NAME'],
+            user=os.environ['DB_USER'],
+            password=os.environ['DB_PASS'],
+            host=os.environ['DB_HOST'],
+            port=os.environ['DB_PORT'],
+        )
+        rewrite_databases_in_settings(settings_path, new_databases)
+        logging.info(f'Rewrote DATABASES block in {settings_path} to use PostgreSQL')
 
     # uwsgi config
-    uwsgi_conf = textwrap.dedent(f'''\
-                [uwsgi]
-                master = True
-                http-socket = 127.0.0.1:{appinfo["port"]}
-                env = LD_LIBRARY_PATH=/usr/sqlite330/lib
-                virtualenv = {appdir}/env/
-                daemonize = /home/{appinfo["osuser_name"]}/logs/apps/{appinfo["name"]}/uwsgi.log
-                pidfile = {appdir}/tmp/uwsgi.pid
-                workers = 2
-                threads = 2
-
-                # adjust the following to point to your project
-                python-path = {appdir}/myproject
-                wsgi-file = {appdir}/myproject/myproject/wsgi.py
-                touch-reload = {appdir}/myproject/myproject/wsgi.py
-                ''')
+    uwsgi_conf = UWSGI_CONF_TEMPLATE.format(
+        port=appinfo['port'],
+        appdir=appdir,
+        osuser_name=appinfo['osuser_name'],
+        app_name=appinfo['name'],
+        project_name=args.project_name,
+    )
     create_file(f'{appdir}/uwsgi.ini', uwsgi_conf, perms=0o600)
 
     # start script
-    start_script = textwrap.dedent(f'''\
-                #!/bin/bash
-                export TMPDIR={appdir}/tmp
-                export LD_LIBRARY_PATH=/usr/sqlite330/lib
-                mkdir -p {appdir}/tmp
-                PIDFILE="{appdir}/tmp/uwsgi.pid"
-
-                if [ -e "$PIDFILE" ] && (pgrep -u {appinfo["osuser_name"]} | grep -x -f $PIDFILE &> /dev/null); then
-                  echo "uWSGI for {appinfo["name"]} already running."
-                  exit 99
-                fi
-
-                {appdir}/env/bin/uwsgi --ini {appdir}/uwsgi.ini
-
-                echo "Started uWSGI for {appinfo["name"]}."
-                ''')
+    start_script = START_SCRIPT_TEMPLATE.format(
+        appdir=appdir,
+        osuser_name=appinfo['osuser_name'],
+        app_name=appinfo['name'],
+    )
     create_file(f'{appdir}/start', start_script, perms=0o700)
 
     # stop script
-    stop_script = textwrap.dedent(f'''\
-                #!/bin/bash
-                PIDFILE="{appdir}/tmp/uwsgi.pid"
-
-                if [ ! -e "$PIDFILE" ]; then
-                    echo "$PIDFILE missing, maybe uWSGI is already stopped?"
-                    exit 99
-                fi
-
-                PID=$(cat $PIDFILE)
-
-                if [ -e "$PIDFILE" ] && (pgrep -u {appinfo["osuser_name"]} | grep -x -f $PIDFILE &> /dev/null); then
-                  {appdir}/env/bin/uwsgi --stop $PIDFILE
-                  sleep 3
-                fi
-
-                if [ -e "$PIDFILE" ] && (pgrep -u {appinfo["osuser_name"]} | grep -x -f $PIDFILE &> /dev/null); then
-                  echo "uWSGI did not stop, killing it."
-                  sleep 3
-                  kill -9 $PID
-                fi
-                rm -f $PIDFILE
-                echo "Stopped."
-                ''')
+    stop_script = STOP_SCRIPT_TEMPLATE.format(
+        appdir=appdir,
+        osuser_name=appinfo['osuser_name'],
+    )
     create_file(f'{appdir}/stop', stop_script, perms=0o700)
 
     # cron
     m = random.randint(0,9)
     croncmd = f'0{m},1{m},2{m},3{m},4{m},5{m} * * * * {appdir}/start > /dev/null 2>&1'
-    cronjob = add_cronjob(croncmd)
+    add_cronjob(croncmd)
 
     # make README
-    readme = textwrap.dedent(f'''\
-                # Opalstack Django README
-
-                ## Post-install steps
-
-                Please take the following steps before you begin to use your Django
-                installation:
-
-                1. Connect your Django application to a site route in the control panel.
-
-                2. Edit {appdir}/myproject/myproject/settings.py to set ALLOWED_HOSTS
-                   to include your site's domains. Example:
-
-                       ALLOWED_HOSTS = ['domain.com', 'www.domain.com']
-
-                3. Run the following commands to restart your Django instance:
-
-                   {appdir}/stop
-                   {appdir}/start
-
-                ## Using your own project
-
-                If you want to serve your own Django project from this instance:
-
-                1. Upload your project directory to {appdir}
-
-                2. Activate the app's environment:
-
-                       source {appdir}/env/bin/activate
-
-                3. Install your project's Python dependencies with pip.
-
-                4. Edit {appdir}/uwsgi.ini to point `wsgi-file` and `touch-reload` at your project's WSGI handler
-
-                5. Run the following commands to restart your Django instance:
-
-                   {appdir}/stop
-                   {appdir}/start
-
-                ## More info
-
-                See https://docs.opalstack.com/topic-guides/django/ for more information.
-                ''')
+    readme = README_TEMPLATE.format(appdir=appdir, project_name=args.project_name)
     create_file(f'{appdir}/README', readme)
 
     # start it
-    cmd = f'{appdir}/start'
-    startit = run_command(cmd)
+    run_command(f'{appdir}/start')
 
     # finished, push a notice with credentials
-    msg = f'See README in app directory for final steps.'
     payload = json.dumps([{'id': args.app_uuid }])
-    finished=api.post('/app/installed/', payload)
+    api.post('/app/installed/', payload)
 
     logging.info(f'Completed installation of Django app {args.app_name}')
 
