@@ -33,6 +33,9 @@ PROJECT_NAME_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 DB_ENV_VARS = ('DB_NAME', 'DB_USER', 'DB_PASS', 'DB_HOST', 'DB_PORT')
 DB_ENGINE_DEFAULT = 'django.db.backends.postgresql'
 
+# OSVar names that the orchestrator sets when the static-app branch is enabled.
+STATIC_ENV_VARS = ('STATIC_ROOT', 'STATIC_URL')
+
 SED_ALLOWED_HOSTS_CMD_TEMPLATE = (
     r'''sed -r -i "s/^ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = \['\*'\]/" '''
     r'''{appdir}/{project_name}/{project_name}/settings.py'''
@@ -284,6 +287,26 @@ def rewrite_databases_in_settings(settings_path, new_block):
         f.write(text[:start] + new_block + text[end:])
 
 
+def rewrite_static_in_settings(settings_path, static_url, static_root):
+    """replaces the existing STATIC_URL line and ensures STATIC_ROOT is set to the Opalstack STA app dir"""
+    with open(settings_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    new_static_url_line = f'STATIC_URL = {static_url!r}'
+    new_static_root_line = f'STATIC_ROOT = {static_root!r}'
+    static_url_re = re.compile(r'^STATIC_URL\s*=.*$', re.MULTILINE)
+    static_root_re = re.compile(r'^STATIC_ROOT\s*=.*$', re.MULTILINE)
+    if static_url_re.search(text):
+        text = static_url_re.sub(new_static_url_line, text, count=1)
+    else:
+        text = text.rstrip() + '\n\n' + new_static_url_line + '\n'
+    if static_root_re.search(text):
+        text = static_root_re.sub(new_static_root_line, text, count=1)
+    else:
+        text = text.rstrip() + '\n' + new_static_root_line + '\n'
+    with open(settings_path, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+
 def main():
     """run it"""
     # grab args from cmd or env
@@ -358,10 +381,10 @@ def main():
     logging.info(f'Wrote initial Django config to {appdir}/{args.project_name}/{args.project_name}/settings.py')
 
     # optional postgres wiring: when DB_* OSVars are present, install psycopg and rewrite DATABASES
+    settings_path = f'{appdir}/{args.project_name}/{args.project_name}/settings.py'
     if all(os.environ.get(k) for k in DB_ENV_VARS):
         run_command(f'scl enable devtoolset-11 -- {appdir}/env/bin/pip install psycopg[binary]')
         logging.info('Installed psycopg[binary] into virtualenv')
-        settings_path = f'{appdir}/{args.project_name}/{args.project_name}/settings.py'
         new_databases = build_databases_block(
             engine=os.environ.get('DB_ENGINE', DB_ENGINE_DEFAULT),
             name=os.environ['DB_NAME'],
@@ -372,6 +395,17 @@ def main():
         )
         rewrite_databases_in_settings(settings_path, new_databases)
         logging.info(f'Rewrote DATABASES block in {settings_path} to use PostgreSQL')
+
+    # optional static-files wiring: when STATIC_* OSVars are present, point Django at the STA app dir and run collectstatic
+    if all(os.environ.get(k) for k in STATIC_ENV_VARS):
+        static_root = os.environ['STATIC_ROOT']
+        static_url = os.environ['STATIC_URL']
+        rewrite_static_in_settings(settings_path, static_url, static_root)
+        logging.info(f'Wrote STATIC_URL={static_url!r} and STATIC_ROOT={static_root!r} into {settings_path}')
+        os.makedirs(static_root, exist_ok=True)
+        manage_py = f'{appdir}/{args.project_name}/manage.py'
+        run_command(f'{appdir}/env/bin/python {manage_py} collectstatic --noinput')
+        logging.info(f'Ran collectstatic into {static_root}')
 
     # uwsgi config
     uwsgi_conf = UWSGI_CONF_TEMPLATE.format(
