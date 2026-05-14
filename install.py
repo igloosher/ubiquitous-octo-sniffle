@@ -1,4 +1,4 @@
-#! /bin/python3.12
+#! /bin/python3
 
 import argparse
 import sys
@@ -29,11 +29,11 @@ DEFAULT_DJANGO_VERSION = '6.0.5'
 DEFAULT_PROJECT_NAME = 'myproject'
 PROJECT_NAME_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 
-# OSVar names that the orchestrator sets when the postgres branch is enabled.
+# OSVar names that the orchestrator sets when the postgres branch is enabled; fetched via the Opalstack API at install time because Opalstack does not source user OSVars into the installer's process environment.
 DB_ENV_VARS = ('DB_NAME', 'DB_USER', 'DB_PASS', 'DB_HOST', 'DB_PORT')
 DB_ENGINE_DEFAULT = 'django.db.backends.postgresql'
 
-# OSVar names that the orchestrator sets when the static-app branch is enabled.
+# OSVar names that the orchestrator sets when the static-app branch is enabled; fetched via the Opalstack API at install time for the same reason.
 STATIC_ENV_VARS = ('STATIC_ROOT', 'STATIC_URL')
 
 SED_ALLOWED_HOSTS_CMD_TEMPLATE = (
@@ -287,6 +287,16 @@ def rewrite_databases_in_settings(settings_path, new_block):
         f.write(text[:start] + new_block + text[end:])
 
 
+def fetch_osvars_for_osuser(api, osuser_id):
+    """returns a {name: content} dict of OSVars attached to the given osuser id"""
+    all_osvars = api.get('/osvar/list/')
+    result = {}
+    for v in all_osvars:
+        if osuser_id in (v.get('osusers') or []):
+            result[v.get('name')] = v.get('content')
+    return result
+
+
 def rewrite_static_in_settings(settings_path, static_url, static_root):
     """replaces the existing STATIC_URL line and ensures STATIC_ROOT is set to the Opalstack STA app dir"""
     with open(settings_path, 'r', encoding='utf-8') as f:
@@ -348,6 +358,12 @@ def main():
     appinfo = api.get(f'/app/read/{args.app_uuid}')
     appdir = f'/home/{appinfo["osuser_name"]}/apps/{appinfo["name"]}'
 
+    # Fetch user-scoped OSVars via the API; Opalstack does not source them into the installer's process environment.
+    osuser_ref = appinfo.get('osuser')
+    osuser_id = osuser_ref.get('id') if isinstance(osuser_ref, dict) else osuser_ref
+    osvars = fetch_osvars_for_osuser(api, osuser_id) if osuser_id else {}
+    logging.info(f'Fetched {len(osvars)} OSVars for osuser {appinfo["osuser_name"]}: {sorted(osvars.keys())}')
+
     # create tmp dir
     os.mkdir(f'{appdir}/tmp', 0o700)
     logging.info(f'Created directory {appdir}/tmp')
@@ -382,30 +398,36 @@ def main():
 
     # optional postgres wiring: when DB_* OSVars are present, install psycopg and rewrite DATABASES
     settings_path = f'{appdir}/{args.project_name}/{args.project_name}/settings.py'
-    if all(os.environ.get(k) for k in DB_ENV_VARS):
+    if all(osvars.get(k) for k in DB_ENV_VARS):
         run_command(f'scl enable devtoolset-11 -- {appdir}/env/bin/pip install psycopg[binary]')
         logging.info('Installed psycopg[binary] into virtualenv')
         new_databases = build_databases_block(
-            engine=os.environ.get('DB_ENGINE', DB_ENGINE_DEFAULT),
-            name=os.environ['DB_NAME'],
-            user=os.environ['DB_USER'],
-            password=os.environ['DB_PASS'],
-            host=os.environ['DB_HOST'],
-            port=os.environ['DB_PORT'],
+            engine=osvars.get('DB_ENGINE', DB_ENGINE_DEFAULT),
+            name=osvars['DB_NAME'],
+            user=osvars['DB_USER'],
+            password=osvars['DB_PASS'],
+            host=osvars['DB_HOST'],
+            port=osvars['DB_PORT'],
         )
         rewrite_databases_in_settings(settings_path, new_databases)
         logging.info(f'Rewrote DATABASES block in {settings_path} to use PostgreSQL')
+    else:
+        missing_db = [k for k in DB_ENV_VARS if not osvars.get(k)]
+        logging.info(f'Skipping postgres wiring; missing OSVars: {missing_db}')
 
     # optional static-files wiring: when STATIC_* OSVars are present, point Django at the STA app dir and run collectstatic
-    if all(os.environ.get(k) for k in STATIC_ENV_VARS):
-        static_root = os.environ['STATIC_ROOT']
-        static_url = os.environ['STATIC_URL']
+    if all(osvars.get(k) for k in STATIC_ENV_VARS):
+        static_root = osvars['STATIC_ROOT']
+        static_url = osvars['STATIC_URL']
         rewrite_static_in_settings(settings_path, static_url, static_root)
         logging.info(f'Wrote STATIC_URL={static_url!r} and STATIC_ROOT={static_root!r} into {settings_path}')
         os.makedirs(static_root, exist_ok=True)
         manage_py = f'{appdir}/{args.project_name}/manage.py'
         run_command(f'{appdir}/env/bin/python {manage_py} collectstatic --noinput')
         logging.info(f'Ran collectstatic into {static_root}')
+    else:
+        missing_static = [k for k in STATIC_ENV_VARS if not osvars.get(k)]
+        logging.info(f'Skipping static-files wiring; missing OSVars: {missing_static}')
 
     # uwsgi config
     uwsgi_conf = UWSGI_CONF_TEMPLATE.format(
