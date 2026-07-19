@@ -36,6 +36,9 @@ DB_ENGINE_DEFAULT = "django.db.backends.postgresql"
 # OSVar names that the orchestrator sets when the static-app branch is enabled; fetched via the Opalstack API at install time for the same reason.
 STATIC_ENV_VARS = ("STATIC_ROOT", "STATIC_URL")
 
+# OSVar names that the orchestrator sets when the media-app branch is enabled; fetched via the Opalstack API at install time for the same reason.
+MEDIA_ENV_VARS = ("MEDIA_ROOT", "MEDIA_URL")
+
 SED_ALLOWED_HOSTS_CMD_TEMPLATE = (
     r"""sed -r -i "s/^ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = \['\*'\]/" """
     r"""{appdir}/{project_name}/{project_name}/settings.py"""
@@ -319,6 +322,26 @@ def rewrite_static_in_settings(settings_path, static_url, static_root):
         f.write(text)
 
 
+def rewrite_media_in_settings(settings_path, media_url, media_root):
+    """replaces the existing MEDIA_URL line and ensures MEDIA_ROOT is set to the Opalstack STA app dir"""
+    with open(settings_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    new_media_url_line = f"MEDIA_URL = {media_url!r}"
+    new_media_root_line = f"MEDIA_ROOT = {media_root!r}"
+    media_url_re = re.compile(r"^MEDIA_URL\s*=.*$", re.MULTILINE)
+    media_root_re = re.compile(r"^MEDIA_ROOT\s*=.*$", re.MULTILINE)
+    if media_url_re.search(text):
+        text = media_url_re.sub(new_media_url_line, text, count=1)
+    else:
+        text = text.rstrip() + "\n\n" + new_media_url_line + "\n"
+    if media_root_re.search(text):
+        text = media_root_re.sub(new_media_root_line, text, count=1)
+    else:
+        text = text.rstrip() + "\n" + new_media_root_line + "\n"
+    with open(settings_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 def main():
     """run it"""
     # grab args from cmd or env
@@ -498,6 +521,19 @@ def main():
     else:
         missing_static = [k for k in STATIC_ENV_VARS if not osvars.get(k)]
         logging.info(f"Skipping static-files wiring; missing OSVars: {missing_static}")
+
+    # optional media-files wiring: when MEDIA_* OSVars are present, point Django at the media STA app dir
+    if all(osvars.get(k) for k in MEDIA_ENV_VARS):
+        media_root = osvars["MEDIA_ROOT"]
+        media_url = osvars["MEDIA_URL"]
+        rewrite_media_in_settings(settings_path, media_url, media_root)
+        logging.info(
+            f"Wrote MEDIA_URL={media_url!r} and MEDIA_ROOT={media_root!r} into {settings_path}"
+        )
+        os.makedirs(media_root, exist_ok=True)
+    else:
+        missing_media = [k for k in MEDIA_ENV_VARS if not osvars.get(k)]
+        logging.info(f"Skipping media-files wiring; missing OSVars: {missing_media}")
 
     # apply initial Django migrations against whichever backend settings.py now points at
     manage_py = f"{appdir}/{args.project_name}/manage.py"
