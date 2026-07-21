@@ -39,10 +39,8 @@ STATIC_ENV_VARS = ("STATIC_ROOT", "STATIC_URL")
 # OSVar names that the orchestrator sets when the media-app branch is enabled; fetched via the Opalstack API at install time for the same reason.
 MEDIA_ENV_VARS = ("MEDIA_ROOT", "MEDIA_URL")
 
-SED_ALLOWED_HOSTS_CMD_TEMPLATE = (
-    r"""sed -r -i "s/^ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = \['\*'\]/" """
-    r"""{appdir}/{project_name}/{project_name}/settings.py"""
-)
+# OSVar name that the orchestrator sets to the site's public domain; used to pin ALLOWED_HOSTS.
+SITE_DOMAIN_ENV_VAR = "SITE_DOMAIN"
 
 UWSGI_CONF_TEMPLATE = textwrap.dedent("""\
     [uwsgi]
@@ -103,6 +101,34 @@ STOP_SCRIPT_TEMPLATE = textwrap.dedent("""\
     echo "Stopped."
     """)
 
+AXES_SETTINGS_BLOCK = textwrap.dedent("""\
+
+    #
+    #    DJANGO AXES
+    #
+
+    AUTHENTICATION_BACKENDS = [
+        'axes.backends.AxesStandaloneBackend',
+        'django.contrib.auth.backends.ModelBackend',
+    ]
+
+    # axes: brute-force protection
+    AXES_ENABLED = True
+    AXES_FAILURE_LIMIT = 5
+    # datetime.timedelta or hours as int; attempts forgotten after this
+    AXES_COOLOFF_TIME = 1
+    # locks on the username alone: behind the front proxy every client shares
+    # the same upstream address, so ip_address tracking would let one attacker
+    # lock out the whole site
+    AXES_LOCKOUT_PARAMETERS = ['username']
+    # successful login clears that user's failure counter
+    AXES_RESET_ON_SUCCESS = True
+
+    # custom message shown on lockout (default is a plain 429 response)
+    AXES_LOCKOUT_TEMPLATE = None          # or 'lockout.html' if you make one
+    AXES_VERBOSE = True
+    """)
+
 README_TEMPLATE = textwrap.dedent("""\
     # Opalstack Django README
 
@@ -113,8 +139,9 @@ README_TEMPLATE = textwrap.dedent("""\
 
     1. Connect your Django application to a site route in the control panel.
 
-    2. Edit {appdir}/{project_name}/{project_name}/settings.py to set ALLOWED_HOSTS
-       to include your site's domains. Example:
+    2. Verify ALLOWED_HOSTS in {appdir}/{project_name}/{project_name}/settings.py
+       matches your site's domains (the installer pins it to the SITE_DOMAIN
+       OSVar when present). Example:
 
            ALLOWED_HOSTS = ['domain.com', 'www.domain.com']
 
@@ -322,6 +349,32 @@ def rewrite_static_in_settings(settings_path, static_url, static_root):
         f.write(text)
 
 
+def rewrite_allowed_hosts_in_settings(settings_path, hosts):
+    """replaces the ALLOWED_HOSTS line with the given host list"""
+    with open(settings_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    new_line = f"ALLOWED_HOSTS = {hosts!r}"
+    allowed_hosts_re = re.compile(r"^ALLOWED_HOSTS\s*=.*$", re.MULTILINE)
+    if not allowed_hosts_re.search(text):
+        raise RuntimeError(f"ALLOWED_HOSTS line not found in {settings_path}")
+    text = allowed_hosts_re.sub(new_line, text, count=1)
+    with open(settings_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def rewrite_debug_in_settings(settings_path, debug_value):
+    """replaces the DEBUG line with the given boolean value"""
+    with open(settings_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    new_line = f"DEBUG = {bool(debug_value)!r}"
+    debug_re = re.compile(r"^DEBUG\s*=.*$", re.MULTILINE)
+    if not debug_re.search(text):
+        raise RuntimeError(f"DEBUG line not found in {settings_path}")
+    text = debug_re.sub(new_line, text, count=1)
+    with open(settings_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 def rewrite_media_in_settings(settings_path, media_url, media_root):
     """replaces the existing MEDIA_URL line and ensures MEDIA_ROOT is set to the Opalstack STA app dir"""
     with open(settings_path, "r", encoding="utf-8") as f:
@@ -338,6 +391,33 @@ def rewrite_media_in_settings(settings_path, media_url, media_root):
         text = media_root_re.sub(new_media_root_line, text, count=1)
     else:
         text = text.rstrip() + "\n" + new_media_root_line + "\n"
+    with open(settings_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def append_to_settings_list(text, marker, new_entry, settings_path):
+    """inserts an entry before the closing bracket of a flat settings list"""
+    start = text.find(marker)
+    if start < 0:
+        raise RuntimeError(f"{marker!r} marker not found in {settings_path}")
+    end = text.find("]", start)
+    if end < 0:
+        raise RuntimeError(f"Unterminated {marker!r} list in {settings_path}")
+    return text[:end] + f"    {new_entry!r},\n" + text[end:]
+
+
+def wire_axes_in_settings(settings_path):
+    """registers django-axes: app, middleware, and the settings block at the end"""
+    with open(settings_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    if "axes" in text:
+        raise RuntimeError(f"axes already referenced in {settings_path}")
+    text = append_to_settings_list(text, "INSTALLED_APPS = [", "axes", settings_path)
+    # AxesMiddleware must be last so every earlier middleware has already run
+    text = append_to_settings_list(
+        text, "MIDDLEWARE = [", "axes.middleware.AxesMiddleware", settings_path
+    )
+    text = text.rstrip() + "\n" + AXES_SETTINGS_BLOCK
     with open(settings_path, "w", encoding="utf-8") as f:
         f.write(text)
 
@@ -475,18 +555,26 @@ def main():
     logging.info(f"Populated Django project directory {appdir}/{args.project_name}")
 
     # django config
-    # set ALLOWED_HOSTS
-    run_command(
-        SED_ALLOWED_HOSTS_CMD_TEMPLATE.format(
-            appdir=appdir, project_name=args.project_name
+    settings_path = f"{appdir}/{args.project_name}/{args.project_name}/settings.py"
+
+    # pin ALLOWED_HOSTS to the site's public domain when the SITE_DOMAIN OSVar is
+    # present; falls back to the permissive wildcard only for unorchestrated installs
+    site_domain = osvars.get(SITE_DOMAIN_ENV_VAR)
+    if site_domain:
+        allowed_hosts = [site_domain]
+    else:
+        allowed_hosts = ["*"]
+        logging.warning(
+            f"OSVar {SITE_DOMAIN_ENV_VAR} not set; ALLOWED_HOSTS falls back to ['*']"
         )
-    )
-    logging.info(
-        f"Wrote initial Django config to {appdir}/{args.project_name}/{args.project_name}/settings.py"
-    )
+    rewrite_allowed_hosts_in_settings(settings_path, allowed_hosts)
+    logging.info(f"Wrote ALLOWED_HOSTS = {allowed_hosts!r} into {settings_path}")
+
+    # production default: never ship with DEBUG on
+    rewrite_debug_in_settings(settings_path, False)
+    logging.info(f"Wrote DEBUG = False into {settings_path}")
 
     # optional postgres wiring: when DB_* OSVars are present, install psycopg and rewrite DATABASES
-    settings_path = f"{appdir}/{args.project_name}/{args.project_name}/settings.py"
     if all(osvars.get(k) for k in DB_ENV_VARS):
         run_command(
             f"scl enable devtoolset-11 -- {appdir}/env/bin/pip install psycopg[binary]"
@@ -535,7 +623,16 @@ def main():
         missing_media = [k for k in MEDIA_ENV_VARS if not osvars.get(k)]
         logging.info(f"Skipping media-files wiring; missing OSVars: {missing_media}")
 
-    # apply initial Django migrations against whichever backend settings.py now points at
+    # brute-force protection: install django-axes and wire it into settings.py
+    run_command(
+        f"scl enable devtoolset-11 -- {appdir}/env/bin/pip install django-axes"
+    )
+    logging.info("Installed django-axes into virtualenv")
+    wire_axes_in_settings(settings_path)
+    logging.info(f"Wired django-axes into {settings_path}")
+
+    # apply initial Django migrations against whichever backend settings.py now points at;
+    # runs after the axes wiring so its access-attempt tables are created here too
     manage_py = f"{appdir}/{args.project_name}/manage.py"
     run_command(f"{appdir}/env/bin/python {manage_py} migrate --noinput")
     logging.info("Ran initial Django migrations")
