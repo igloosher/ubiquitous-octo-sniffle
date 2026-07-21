@@ -117,10 +117,8 @@ AXES_SETTINGS_BLOCK = textwrap.dedent("""\
     AXES_FAILURE_LIMIT = 5
     # datetime.timedelta or hours as int; attempts forgotten after this
     AXES_COOLOFF_TIME = 1
-    # locks on the username alone: behind the front proxy every client shares
-    # the same upstream address, so ip_address tracking would let one attacker
-    # lock out the whole site
-    AXES_LOCKOUT_PARAMETERS = ['username']
+    # locks on the username and ip_address
+    AXES_LOCKOUT_PARAMETERS = ['username', 'ip_address']
     # successful login clears that user's failure counter
     AXES_RESET_ON_SUCCESS = True
 
@@ -128,6 +126,14 @@ AXES_SETTINGS_BLOCK = textwrap.dedent("""\
     AXES_LOCKOUT_TEMPLATE = None          # or 'lockout.html' if you make one
     AXES_VERBOSE = True
     """)
+
+TRAP_URLS_BLOCK = (
+    "    # decoy admin endpoints (django-admin-trap); relocate the real admin to a\n"
+    "    # secret path first, then uncomment\n"
+    "    # path('admin/', include('django_admin_trap.urls')),\n"
+    "    # path('wp-admin/', include('django_admin_trap.urls')),\n"
+    "    # path('administrator/', include('django_admin_trap.urls')),\n"
+)
 
 README_TEMPLATE = textwrap.dedent("""\
     # Opalstack Django README
@@ -422,6 +428,44 @@ def wire_axes_in_settings(settings_path):
         f.write(text)
 
 
+def wire_admin_trap_in_settings(settings_path):
+    """registers django-admin-trap in INSTALLED_APPS"""
+    with open(settings_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    if "django_admin_trap" in text:
+        raise RuntimeError(f"django_admin_trap already referenced in {settings_path}")
+    text = append_to_settings_list(
+        text, "INSTALLED_APPS = [", "django_admin_trap", settings_path
+    )
+    with open(settings_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def wire_admin_trap_in_urls(urls_path):
+    """ensures include is imported and inserts the commented decoy endpoints into urlpatterns"""
+    with open(urls_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    if "django_admin_trap" in text:
+        raise RuntimeError(f"django_admin_trap already referenced in {urls_path}")
+    import_re = re.compile(r"^from django\.urls import (.+)$", re.MULTILINE)
+    import_match = import_re.search(text)
+    if not import_match:
+        raise RuntimeError(f"django.urls import not found in {urls_path}")
+    imported_names = [name.strip() for name in import_match.group(1).split(",")]
+    if "include" not in imported_names:
+        imported_names.append("include")
+        new_import_line = f"from django.urls import {', '.join(sorted(imported_names))}"
+        text = import_re.sub(new_import_line, text, count=1)
+    marker = "urlpatterns = ["
+    start = text.find(marker)
+    if start < 0:
+        raise RuntimeError(f"{marker!r} marker not found in {urls_path}")
+    insert_at = text.find("\n", start) + 1
+    text = text[:insert_at] + TRAP_URLS_BLOCK + text[insert_at:]
+    with open(urls_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 def main():
     """run it"""
     # grab args from cmd or env
@@ -630,6 +674,17 @@ def main():
     logging.info("Installed django-axes into virtualenv")
     wire_axes_in_settings(settings_path)
     logging.info(f"Wired django-axes into {settings_path}")
+
+    # decoy admin: install django-admin-trap (stateless, no migrations) and stage
+    # commented-out trap endpoints in urls.py for manual activation
+    run_command(
+        f"scl enable devtoolset-11 -- {appdir}/env/bin/pip install django-admin-trap"
+    )
+    logging.info("Installed django-admin-trap into virtualenv")
+    wire_admin_trap_in_settings(settings_path)
+    urls_path = f"{appdir}/{args.project_name}/{args.project_name}/urls.py"
+    wire_admin_trap_in_urls(urls_path)
+    logging.info(f"Wired django-admin-trap into {settings_path} and {urls_path}")
 
     # apply initial Django migrations against whichever backend settings.py now points at;
     # runs after the axes wiring so its access-attempt tables are created here too
